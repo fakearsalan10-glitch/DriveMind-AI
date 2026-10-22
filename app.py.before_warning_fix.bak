@@ -1,0 +1,836 @@
+
+import os
+import tempfile
+import time
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from ultralytics import YOLO
+
+st.set_page_config(
+    page_title="DriveMind AI",
+    page_icon="ðŸš˜",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+.stApp {
+    background: #0b1020;
+    color: #edf2ff;
+}
+.block-container {
+    max-width: 1500px;
+    padding-top: 1.5rem;
+}
+.dm-header {
+    background: linear-gradient(120deg, #142442, #101522);
+    border: 1px solid #293b5c;
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+}
+.dm-title {
+    font-size: 35px;
+    font-weight: 800;
+    color: #f4f7ff;
+}
+.dm-subtitle {
+    color: #aab8d2;
+}
+.panel {
+    background: #121a2d;
+    border: 1px solid #293b5c;
+    border-radius: 13px;
+    padding: 17px;
+    margin-bottom: 12px;
+}
+.small-label {
+    font-size: 12px;
+    color: #9aacc9;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.big-value {
+    font-size: 23px;
+    font-weight: 750;
+    margin-top: 7px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="dm-header">
+    <div class="dm-title">ðŸš˜ DriveMind AI</div>
+    <div class="dm-subtitle">
+        Computer Vision â€¢ Lane Analysis â€¢ Driving Decision Support
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ---------------- SESSION STATE ----------------
+
+if "model" not in st.session_state:
+    st.session_state.model = None
+
+if "detections" not in st.session_state:
+    st.session_state.detections = None
+
+if "decisions" not in st.session_state:
+    st.session_state.decisions = None
+
+
+# ---------------- SIDEBAR ----------------
+
+st.sidebar.header("AI Configuration")
+
+confidence = st.sidebar.slider(
+    "YOLO Confidence",
+    0.10, 0.90, 0.35, 0.05
+)
+
+frame_step = st.sidebar.select_slider(
+    "Processing Speed",
+    options=[1, 2, 3, 5],
+    value=2,
+    format_func=lambda x: f"Every {x} frame(s)",
+)
+
+show_boxes = st.sidebar.checkbox(
+    "Show Detection Boxes", True
+)
+
+show_labels = st.sidebar.checkbox(
+    "Show Object Labels and IDs", True
+)
+
+show_lane_lines = st.sidebar.checkbox(
+    "Show Estimated Lane Markings", True
+)
+
+st.sidebar.caption(
+    "Front-camera visual analysis only. "
+    "Lane recommendations are provisional, not driving commands."
+)
+
+
+# ---------------- LANE DETECTION ----------------
+
+def detect_lane_markings(frame):
+    """
+    Approximate lane-marking detection using Canny and Hough lines.
+    This is a basic visual estimate, not a trained lane segmentation model.
+    """
+    height, width = frame.shape[:2]
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 55, 150)
+
+    mask = np.zeros_like(edges)
+
+    polygon = np.array([[
+        (int(width * 0.05), height),
+        (int(width * 0.42), int(height * 0.48)),
+        (int(width * 0.58), int(height * 0.48)),
+        (int(width * 0.98), height),
+    ]], dtype=np.int32)
+
+    cv2.fillPoly(mask, polygon, 255)
+    cropped_edges = cv2.bitwise_and(edges, mask)
+
+    segments = cv2.HoughLinesP(
+        cropped_edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=35,
+        minLineLength=max(25, int(width * 0.035)),
+        maxLineGap=80,
+    )
+
+    left_lines = []
+    right_lines = []
+
+    if segments is not None:
+        for segment in segments:
+            coords = np.asarray(segment).reshape(-1)
+
+            if coords.size < 4:
+                continue
+
+            x1, y1, x2, y2 = map(int, coords[:4])
+
+            dx = x2 - x1
+            dy = y2 - y1
+
+            if abs(dx) < 8:
+                continue
+
+            slope = dy / dx
+
+            if abs(slope) < 0.35:
+                continue
+
+            # In image coordinates, left lane lines normally slope down-left.
+            if slope < 0 and (x1 + x2) / 2 < width * 0.60:
+                left_lines.append((x1, y1, x2, y2))
+
+            elif slope > 0 and (x1 + x2) / 2 > width * 0.40:
+                right_lines.append((x1, y1, x2, y2))
+
+    def average_line(lines):
+        if not lines:
+            return None
+
+        points = []
+        for x1, y1, x2, y2 in lines:
+            points.extend([(x1, y1), (x2, y2)])
+
+        points = np.array(points, dtype=np.float32)
+        vx, vy, x0, y0 = cv2.fitLine(
+            points,
+            cv2.DIST_L2,
+            0,
+            0.01,
+            0.01
+        ).flatten()
+
+        if abs(vy) < 1e-6:
+            return None
+
+        y_bottom = height - 1
+        y_top = int(height * 0.52)
+
+        x_bottom = int(x0 + (y_bottom - y0) * vx / vy)
+        x_top = int(x0 + (y_top - y0) * vx / vy)
+
+        return (
+            max(0, min(width - 1, x_bottom)),
+            y_bottom,
+            max(0, min(width - 1, x_top)),
+            y_top,
+        )
+
+    left_line = average_line(left_lines)
+    right_line = average_line(right_lines)
+
+    # Reject implausible line positions.
+    if left_line and left_line[0] > width * 0.65:
+        left_line = None
+
+    if right_line and right_line[0] < width * 0.35:
+        right_line = None
+
+    if left_line and right_line:
+        if left_line[0] >= right_line[0]:
+            left_line = None
+            right_line = None
+
+    return left_line, right_line
+
+
+# ---------------- DRIVING DECISION LOGIC ----------------
+
+VEHICLE_CLASSES = {
+    "car", "truck", "bus", "motorcycle"
+}
+
+def analyze_driving_situation(
+    objects,
+    frame_width,
+    frame_height,
+    left_lane,
+    right_lane,
+):
+    """
+    Rule-based visual guidance.
+    It does not calculate real-world distance, speed or TTC.
+    """
+
+    vehicle_objects = [
+        obj for obj in objects
+        if obj["Object"] in VEHICLE_CLASSES
+    ]
+
+    center_x = frame_width / 2
+    front_obstacle = False
+    max_front_risk = 0.0
+    front_vehicle = None
+
+    left_zone_vehicles = 0
+    right_zone_vehicles = 0
+
+    for obj in vehicle_objects:
+        x1, y1, x2, y2 = obj["Box"]
+
+        obj_center_x = (x1 + x2) / 2
+        obj_center_y = (y1 + y2) / 2
+
+        box_area = max(0, x2 - x1) * max(0, y2 - y1)
+        frame_area = max(1, frame_width * frame_height)
+        area_ratio = box_area / frame_area
+
+        # Broad screen regions are only rough image-position estimates.
+        if obj_center_x < frame_width * 0.38:
+            left_zone_vehicles += 1
+
+        if obj_center_x > frame_width * 0.62:
+            right_zone_vehicles += 1
+
+        central = abs(obj_center_x - center_x) < frame_width * 0.23
+        lower = obj_center_y > frame_height * 0.48
+
+        # Large central/lower vehicle boxes trigger visual caution.
+        risk_score = area_ratio * 1000
+
+        if central and lower:
+            if risk_score > max_front_risk:
+                max_front_risk = risk_score
+                front_vehicle = obj
+
+            if area_ratio >= 0.025 or y2 > frame_height * 0.88:
+                front_obstacle = True
+
+    lane_count = int(left_lane is not None) + int(right_lane is not None)
+
+    if lane_count == 2:
+        lane_status = "Both lane boundaries estimated"
+    elif lane_count == 1:
+        lane_status = "Only one boundary estimated"
+    else:
+        lane_status = "Lane boundaries unclear"
+
+    if front_obstacle:
+        action = "SLOW DOWN / BRAKE"
+        reason = (
+            "A large vehicle appears in the central/lower image region. "
+            "Reduce speed and maintain control."
+        )
+        urgency = "HIGH VISUAL CAUTION"
+
+        # Do not declare either adjacent lane safe from a front camera.
+        target = "Current lane â€” reduce speed first"
+        maneuver = (
+            "Do not swerve automatically. Consider a lane change only "
+            "after confirming adjacent traffic, markings and blind spots."
+        )
+
+    elif front_vehicle is not None:
+        action = "CAUTIOUS APPROACH"
+        reason = (
+            "A vehicle is visible ahead. Its actual distance and closing "
+            "speed cannot be determined reliably from this image alone."
+        )
+        urgency = "MODERATE VISUAL CAUTION"
+        target = "Current lane â€” maintain a safe following distance"
+        maneuver = (
+            "Monitor the vehicle and road. Do not change lanes solely "
+            "because a vehicle has been detected."
+        )
+
+    else:
+        action = "CONTINUE WITH CAUTION"
+        reason = (
+            "No prominent central/lower vehicle obstacle was identified "
+            "in this processed frame."
+        )
+        urgency = "NO PROMINENT VISUAL ALERT"
+        target = "Current lane â€” continue monitoring"
+        maneuver = (
+            "A clear-looking frame does not prove that the road or "
+            "adjacent lanes are safe."
+        )
+
+    # Visual lane-change candidate only; vehicle counts cannot prove lane safety.
+    if front_obstacle:
+        if lane_count < 2:
+            candidate = "Lane markings unclear"
+            target = "Current lane - slow down and maintain control"
+            maneuver = (
+                "SLOW DOWN / BRAKE. Lane boundaries are unclear, so "
+                "a left/right lane-change candidate cannot be estimated reliably."
+            )
+        elif left_zone_vehicles < right_zone_vehicles:
+            candidate = "Possible LEFT lane-change candidate"
+            target = "Possible left-side option - verify before maneuver"
+            maneuver = (
+                "SLOW DOWN / BRAKE. The left image region has fewer detected "
+                "vehicles, so LEFT is only a visual candidate. Check lane markings, "
+                "blind spot and rear traffic before any lane change."
+            )
+        elif right_zone_vehicles < left_zone_vehicles:
+            candidate = "Possible RIGHT lane-change candidate"
+            target = "Possible right-side option - verify before maneuver"
+            maneuver = (
+                "SLOW DOWN / BRAKE. The right image region has fewer detected "
+                "vehicles, so RIGHT is only a visual candidate. Check lane markings, "
+                "blind spot and rear traffic before any lane change."
+            )
+        else:
+            candidate = "No visually preferred side"
+            target = "Current lane - slow down and maintain control"
+            maneuver = (
+                "SLOW DOWN / BRAKE. Neither side has a clear visual advantage; "
+                "do not change lanes based on this frame alone."
+            )
+
+        side_note = (
+            f"{candidate}. This is a visual suggestion, NOT confirmation "
+            "that the lane is safe. Blind spots and rear traffic are not verified."
+        )
+    else:
+        side_note = (
+            "No lane change is recommended from this frame alone. "
+            "Continue monitoring the road and surrounding traffic."
+        )
+
+    return {
+        "action": action,
+        "reason": reason,
+        "urgency": urgency,
+        "target": target,
+        "maneuver": maneuver,
+        "lane_status": lane_status,
+        "side_note": side_note,
+        "front_obstacle": front_obstacle,
+        "left_zone_vehicles": left_zone_vehicles,
+        "right_zone_vehicles": right_zone_vehicles,
+    }
+
+
+# ---------------- UPLOAD AREA ----------------
+
+uploaded_video = st.file_uploader(
+    "ðŸ“ Upload dashcam video",
+    type=["mp4", "avi", "mov", "mkv"],
+)
+
+if uploaded_video is None:
+    st.info(
+        "Upload a short front-facing dashcam video to begin the analysis."
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("""
+        <div class="panel">
+        <div class="small-label">VISION ENGINE</div>
+        <div class="big-value">YOLO</div>
+        Vehicle and object detection
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c2:
+        st.markdown("""
+        <div class="panel">
+        <div class="small-label">ROAD ANALYSIS</div>
+        <div class="big-value">Lane Vision</div>
+        Approximate visible lane markings
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c3:
+        st.markdown("""
+        <div class="panel">
+        <div class="small-label">DECISION SUPPORT</div>
+        <div class="big-value">DriveMind</div>
+        Rule-based visual recommendations
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.stop()
+
+st.video(uploaded_video)
+
+
+# ---------------- PROCESS VIDEO ----------------
+
+if st.button(
+    "ðŸš€ START AI ANALYSIS",
+    type="primary",
+    use_container_width=True,
+):
+    temp_path = None
+    cap = None
+
+    try:
+        suffix = os.path.splitext(uploaded_video.name)[1] or ".mp4"
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        ) as temp_file:
+            temp_file.write(uploaded_video.getvalue())
+            temp_path = temp_file.name
+
+        status = st.empty()
+        progress = st.progress(0)
+
+        if st.session_state.model is None:
+            status.info("Loading pretrained YOLO model...")
+            st.session_state.model = YOLO("yolo11n.pt")
+
+        model = st.session_state.model
+        cap = cv2.VideoCapture(temp_path)
+
+        if not cap.isOpened():
+            st.error("Video open nahi hua. Doosri video try karo.")
+            st.stop()
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if not fps or fps <= 0:
+            fps = 25.0
+
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        st.caption(
+            f"Resolution: {frame_width} Ã— {frame_height} | "
+            f"Source FPS: {fps:.1f}"
+        )
+
+        video_col, decision_col = st.columns([1.7, 1])
+
+        with video_col:
+            st.subheader("AI Vision Feed")
+            frame_placeholder = st.empty()
+
+        with decision_col:
+            st.subheader("Driving Decision")
+            urgency_placeholder = st.empty()
+            action_placeholder = st.empty()
+            reason_placeholder = st.empty()
+            lane_placeholder = st.empty()
+            target_placeholder = st.empty()
+            side_placeholder = st.empty()
+
+        object_rows = []
+        decision_rows = []
+        processed_frames = 0
+        frame_index = 0
+        max_frames = 600
+        start_time = time.time()
+
+        while cap.isOpened():
+            ok, frame = cap.read()
+
+            if not ok:
+                break
+
+            frame_index += 1
+
+            if (frame_index - 1) % frame_step != 0:
+                continue
+
+            result = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                conf=confidence,
+                verbose=False,
+            )[0]
+
+            annotated = frame.copy()
+            objects = []
+
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls[0].item())
+                    label = model.names.get(class_id, str(class_id))
+                    score = float(box.conf[0].item())
+
+                    coords = (
+                        box.xyxy[0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+                    )
+
+                    x1, y1, x2, y2 = coords.tolist()
+
+                    track_id = None
+                    if box.id is not None:
+                        track_id = int(box.id[0].item())
+
+                    obj = {
+                        "Frame": frame_index,
+                        "Time (s)": round(frame_index / fps, 2),
+                        "Object": label,
+                        "Confidence": round(score, 3),
+                        "Track ID": (
+                            track_id if track_id is not None else "-"
+                        ),
+                        "Box": (x1, y1, x2, y2),
+                    }
+
+                    objects.append(obj)
+
+                    object_rows.append({
+                        "Frame": frame_index,
+                        "Time (s)": obj["Time (s)"],
+                        "Object": label,
+                        "Confidence": obj["Confidence"],
+                        "Track ID": obj["Track ID"],
+                    })
+
+                    if show_boxes:
+                        color = (60, 220, 130)
+
+                        if label in VEHICLE_CLASSES:
+                            color = (30, 180, 255)
+
+                        cv2.rectangle(
+                            annotated,
+                            (x1, y1),
+                            (x2, y2),
+                            color,
+                            2,
+                        )
+
+                    if show_labels:
+                        text_label = f"{label} {score:.0%}"
+
+                        if track_id is not None:
+                            text_label += f" ID:{track_id}"
+
+                        cv2.putText(
+                            annotated,
+                            text_label,
+                            (max(4, x1), max(22, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (255, 255, 255),
+                            2,
+                        )
+
+            left_lane, right_lane = detect_lane_markings(frame)
+
+            if show_lane_lines:
+                if left_lane:
+                    cv2.line(
+                        annotated,
+                        (left_lane[0], left_lane[1]),
+                        (left_lane[2], left_lane[3]),
+                        (0, 255, 255),
+                        4,
+                    )
+
+                if right_lane:
+                    cv2.line(
+                        annotated,
+                        (right_lane[0], right_lane[1]),
+                        (right_lane[2], right_lane[3]),
+                        (0, 255, 255),
+                        4,
+                    )
+
+            decision = analyze_driving_situation(
+                objects,
+                frame_width,
+                frame_height,
+                left_lane,
+                right_lane,
+            )
+
+            # Show the current driving recommendation on the video.
+            cv2.rectangle(
+                annotated,
+                (10, 45),
+                (min(frame_width - 10, 550), 100),
+                (15, 24, 43),
+                -1,
+            )
+
+            cv2.putText(
+                annotated,
+                decision["action"],
+                (20, 78),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (50, 220, 255),
+                2,
+            )
+
+            rgb_frame = cv2.cvtColor(
+                annotated,
+                cv2.COLOR_BGR2RGB,
+            )
+
+            frame_placeholder.image(
+                rgb_frame,
+                channels="RGB",
+                use_container_width=True,
+            )
+
+            if decision["front_obstacle"]:
+                urgency_placeholder.error(decision["urgency"])
+            elif decision["action"] == "CAUTIOUS APPROACH":
+                urgency_placeholder.warning(decision["urgency"])
+            else:
+                urgency_placeholder.info(decision["urgency"])
+
+            action_placeholder.markdown(
+                f"""
+                <div class="panel">
+                    <div class="small-label">RECOMMENDED ACTION</div>
+                    <div class="big-value">{decision["action"]}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            reason_placeholder.write(decision["reason"])
+
+            lane_placeholder.markdown(
+                f"""
+                <div class="panel">
+                    <div class="small-label">LANE PERCEPTION</div>
+                    <div class="big-value">{decision["lane_status"]}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            target_placeholder.markdown(
+                f"""
+                <div class="panel">
+                    <div class="small-label">TARGET / POSITION</div>
+                    <div class="big-value">{decision["target"]}</div>
+                    <p>{decision["maneuver"]}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            side_placeholder.info(decision["side_note"])
+
+            decision_rows.append({
+                "Frame": frame_index,
+                "Time (s)": round(frame_index / fps, 2),
+                "Recommended action": decision["action"],
+                "Visual urgency": decision["urgency"],
+                "Lane markings": decision["lane_status"],
+                "Target position": decision["target"],
+                "Front obstacle": decision["front_obstacle"],
+                "Left-side detected vehicles": decision["left_zone_vehicles"],
+                "Right-side detected vehicles": decision["right_zone_vehicles"],
+            })
+
+            processed_frames += 1
+
+            if total_frames > 0:
+                progress.progress(
+                    min(1.0, frame_index / total_frames)
+                )
+
+            status.info(
+                f"Frame {frame_index}/{total_frames} | "
+                f"Analyzed: {processed_frames}"
+            )
+
+        cap.release()
+        cap = None
+
+        st.session_state.detections = pd.DataFrame(object_rows)
+        st.session_state.decisions = pd.DataFrame(decision_rows)
+
+        elapsed = time.time() - start_time
+
+        status.success(
+            f"Analysis complete â€” {processed_frames} frames "
+            f"in {elapsed:.1f} seconds."
+        )
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric("Frames Analyzed", processed_frames)
+        m2.metric("Object Detections", len(object_rows))
+        m3.metric(
+            "Detected Object Types",
+            len(set(row["Object"] for row in object_rows)),
+        )
+
+
+    except Exception as exc:
+        st.error(f"Analysis failed: {exc}")
+        st.exception(exc)
+
+    finally:
+        if cap is not None:
+            cap.release()
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+# ---------------- DOWNLOADABLE REPORTS ----------------
+
+if st.session_state.detections is not None:
+    st.divider()
+    st.subheader("Object Detection Report")
+
+    detections_df = st.session_state.detections
+
+    if not detections_df.empty:
+        counts = (
+            detections_df["Object"]
+            .value_counts()
+            .rename_axis("Object")
+            .reset_index(name="Detections")
+        )
+
+        st.dataframe(
+            counts,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("View all detections"):
+            st.dataframe(
+                detections_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.download_button(
+            "Download Detection CSV",
+            detections_df.to_csv(index=False).encode("utf-8"),
+            file_name="drivemind_detections.csv",
+            mime="text/csv",
+        )
+
+if st.session_state.decisions is not None:
+    st.subheader("Driving Decision History")
+
+    st.dataframe(
+        st.session_state.decisions,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "Download Driving Decision Report",
+        st.session_state.decisions.to_csv(index=False).encode("utf-8"),
+        file_name="drivemind_decision_report.csv",
+        mime="text/csv",
+    )
+
+st.divider()
+
+st.caption(
+    "Research prototype only. Lane lines are approximate and may be "
+    "incorrect. Visual vehicle size is not calibrated distance or "
+    "time-to-collision. Front-camera video cannot establish that an "
+    "adjacent lane or blind spot is clear. Do not use recommendations "
+    "to control a real vehicle."
+)
+
